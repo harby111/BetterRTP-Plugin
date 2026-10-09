@@ -1,0 +1,252 @@
+# ============================================================================
+#  BetterRTP configuration
+#  Lightweight random teleportation for Paper/Purpur 26.2 (Java 25)
+#  Text fields use MiniMessage: https://docs.advntr.dev/minimessage/format.html
+#  Use /rtp reload after editing. Invalid values fall back to safe defaults
+#  and print a warning in the console.
+# ============================================================================
+
+# --- General ----------------------------------------------------------------
+# Preferred Overworld. If missing/invalid, the first enabled NORMAL world in "worlds:" is used.
+# The Nether / End are resolved automatically (<world>_nether, world_nether, then first in "worlds:").
+world: "world"
+
+cooldown-time: 30        # seconds, per player, applied only after a SUCCESSFUL teleport
+countdown-time: 5        # seconds
+cancel-on-move: true     # damage and world change always cancel
+
+# Global defaults, used by any world entry that does not override them.
+radius: 3000
+shape: "SQUARE"          # only SQUARE is supported
+min-y: 64                # standing Y (feet), NOT the floor block Y
+max-y: 320
+
+safe-location-attempts: 50
+teleport-max-search-seconds: 20
+# true  = chunks may be generated asynchronously while searching.
+# false = only already-generated chunks are used (never generates; fewer valid candidates).
+preload-chunks: true
+
+rtpgui-command-enabled: true   # enables /rtpgui
+open-on-rtp: true              # false = /rtp teleports to the Overworld directly, no menu
+debug: false
+
+# --- Worlds -----------------------------------------------------------------
+# Keys must match the real world folder/name. Optional per-world: cooldown-time, center.
+# If "center" is omitted, the world's WorldBorder center is used.
+worlds:
+  world:
+    enabled: true
+    radius: 3000
+    shape: "SQUARE"
+    min-y: 64
+    max-y: 320
+    cooldown-time: 30
+    center:
+      x: 0
+      z: 0
+  world_nether:
+    enabled: true
+    radius: 3000
+    shape: "SQUARE"
+    min-y: 33
+    max-y: 120
+  world_the_end:
+    enabled: true
+    radius: 3000
+    shape: "SQUARE"
+    min-y: 64
+    max-y: 320
+
+# --- Location cache (optional, disabled by default) ---------------------------
+# Stores only X/Z pairs (a few bytes each). Every entry is fully re-validated before use.
+location-cache:
+  enabled: false
+  size: 25                    # per destination world, max 200
+  refill-interval-ticks: 200  # at most one new entry per world per interval
+
+# --- Biome RTP ----------------------------------------------------------------
+biome-rtp:
+  enabled: true
+  generate-chunks: true
+  attempts-multiplier: 3      # max candidates = safe-location-attempts * multiplier (clamped)
+
+# --- Extra blocks that are never allowed under/at the player (feet, head, floor) ---
+# Built-in hazards (lava, water, fire, cactus, magma, campfires, powder snow, berry bush, wither rose...) are always checked too.
+blacklisted-blocks:
+  - BEDROCK
+  - OAK_LEAVES
+  - SPRUCE_LEAVES
+  - BIRCH_LEAVES
+  - JUNGLE_LEAVES
+  - ACACIA_LEAVES
+  - DARK_OAK_LEAVES
+  - MANGROVE_LEAVES
+
+# --- Safety -----------------------------------------------------------------
+safety:
+  reject-water: true
+  reject-lava: true
+  reject-fire: true
+  reject-hazards: true        # cactus, magma, powder snow, berry bush, cobwebs, portals...
+  reject-underground: true    # ceiling check (Overworld/End) + openness check (Nether)
+  vertical-clearance: 2       # free blocks required at feet/head (2-4)
+  underground-check:
+    ignore-leaves: true       # trees do not count as a "cave ceiling"
+    max-scan-height: 64       # how far above the player to look for a ceiling
+  nether:
+    enabled: true
+    minimum-open-height: 8    # free vertical space required above the floor in the Nether
+
+# --- Performance --------------------------------------------------------------
+performance:
+  max-global-active-searches: 4   # searches running at once (backpressure)
+  max-queue-size: 16              # extra requests waiting for a slot; beyond this they fail gracefully
+  chunk-load-timeout-ms: 3000     # give up on a candidate chunk after this long
+  max-candidates-per-second: 10   # global candidate evaluation rate
+
+# --- Effects ----------------------------------------------------------------
+teleport-sound:
+  enabled: true
+  sound-type: "ENTITY_ENDERMAN_TELEPORT"
+  volume: 1.0
+  pitch: 1.0
+
+countdown-sound:
+  enabled: true
+  sound-type: "BLOCK_NOTE_BLOCK_BANJO"
+  volume: 0.5
+  pitch: 1.0
+
+countdown-display:
+  actionbar-enabled: true
+  title-enabled: false
+  bossbar-enabled: false
+  bossbar-color: "GREEN"          # PINK BLUE RED GREEN YELLOW PURPLE WHITE
+  bossbar-style: "SEGMENTED_10"   # SOLID SEGMENTED_6 SEGMENTED_10 SEGMENTED_12 SEGMENTED_20
+
+particles:
+  countdown:
+    enabled: true
+    type: "PORTAL"     # only particles without extra data are supported
+    count: 12          # max 100
+    radius: 1.1        # >0 draws a ring around the player
+    spread: 0.0
+  teleport:
+    enabled: true
+    type: "CLOUD"
+    count: 28
+    radius: 0.0
+    spread: 0.6
+
+# --- Destination display names (used in messages / titles) --------------------
+destination-names:
+  overworld: "Overworld"
+  nether: "Nether"
+  end: "The End"
+
+# --- Java GUI -----------------------------------------------------------------
+# 27 slots, exactly three destinations. Slots are 0-26 and must be distinct.
+gui:
+  title: "<gradient:green:aqua><bold>BetterRTP</bold></gradient> <dark_gray>- Choose a destination"
+  filler:
+    material: "GRAY_STAINED_GLASS_PANE"
+  items:
+    overworld:
+      slot: 11
+      material: "GRASS_BLOCK"
+      name: "<green><bold><destination>"
+      lore:
+        - "<gray>Random safe spot in the Overworld."
+        - ""
+        - "<dark_gray>Area: <white>±<radius> blocks"
+        - "<yellow>» Click to teleport"
+    nether:
+      slot: 13
+      material: "NETHERRACK"
+      name: "<red><bold><destination>"
+      lore:
+        - "<gray>Random safe spot in the Nether."
+        - ""
+        - "<dark_gray>Area: <white>±<radius> blocks"
+        - "<yellow>» Click to teleport"
+    end:
+      slot: 15
+      material: "END_STONE"
+      name: "<light_purple><bold><destination>"
+      lore:
+        - "<gray>Random safe spot in The End."
+        - ""
+        - "<dark_gray>Area: <white>±<radius> blocks"
+        - "<yellow>» Click to teleport"
+  unavailable:
+    material: "BARRIER"
+    name: "<red><destination> <dark_gray>(unavailable)"
+    lore:
+      - "<gray>This destination is not available"
+      - "<gray>on this server right now."
+
+# --- Bedrock GUI (Geyser/Floodgate, native SimpleForm) -------------------------
+# Always exactly three buttons. "enabled: false" on a button keeps it visible but
+# makes it answer with the "destination-unavailable" message.
+# If bedrock-gui.enabled is false, Bedrock players get the Java inventory menu.
+bedrock-gui:
+  enabled: true
+  title: "<gradient:green:aqua>BetterRTP</gradient>"
+  content: "Choose where you want to teleport."
+  buttons:
+    overworld:
+      enabled: true
+      text: "🌱 Overworld"
+      image: { enabled: false, type: "PATH", data: "" }   # type: PATH or URL
+    nether:
+      enabled: true
+      text: "🔥 Nether"
+      image: { enabled: false, type: "PATH", data: "" }
+    end:
+      enabled: true
+      text: "🌌 The End"
+      image: { enabled: false, type: "PATH", data: "" }
+
+# --- Messages -----------------------------------------------------------------
+# <prefix> is replaced by messages.prefix. Set a message to "" to disable it.
+# Placeholders: <seconds> <time> <destination> <world> <biome> <x> <y> <z>
+messages:
+  prefix: "<gradient:green:aqua><bold>BetterRTP</bold></gradient> <dark_gray>»</dark_gray> "
+  no-permission: "<prefix><red>You don't have permission to do that."
+  player-only: "<prefix><red>This command can only be used by players."
+  cooldown: "<prefix><yellow>Please wait <white><time></white> before using RTP again."
+  already-in-progress: "<prefix><red>You already have a teleport in progress."
+  countdown-actionbar: "<green>Teleporting in <yellow><bold><seconds></bold></yellow> <gray>- don't move!"
+  countdown-title: "<yellow><bold><seconds>"
+  countdown-subtitle: "<gray>Teleporting to <white><destination>"
+  countdown-bossbar: "<green>Teleporting in <white><seconds>s"
+  searching: "<prefix><gray>Searching for a safe location..."
+  queued: "<prefix><gray>The server is busy, you're in the queue..."
+  busy: "<prefix><red>The server is busy right now. Please try again in a moment."
+  cancelled-move: "<prefix><red>Teleport cancelled - you moved."
+  cancelled-damage: "<prefix><red>Teleport cancelled - you took damage."
+  cancelled-world: "<prefix><red>Teleport cancelled - you changed world."
+  cancelled-world-unloaded: "<prefix><red>Teleport cancelled - the destination world is unavailable."
+  cancelled-reload: "<prefix><red>Teleport cancelled - the plugin was reloaded."
+  teleport-success: "<prefix><green>Teleported to <white><x>, <y>, <z></white> in <white><world></white>."
+  search-failed: "<prefix><red>Couldn't find a safe location. Please try again."
+  teleport-failed: "<prefix><red>The teleport failed. You have not been charged a cooldown."
+  invalid-world: "<prefix><red>Unknown world: <white><world></white>."
+  world-disabled: "<prefix><red>RTP is not enabled in <white><world></white>."
+  world-unavailable: "<prefix><red>The destination world is currently unavailable."
+  destination-unavailable: "<prefix><red><destination> is not available on this server."
+  invalid-biome: "<prefix><red>Unknown biome: <white><biome></white>."
+  biome-disabled: "<prefix><red>Biome RTP is disabled."
+  bedrock-unavailable: "<prefix><red>The Bedrock menu could not be opened, showing the standard menu instead."
+  config-error: "<prefix><red>RTP is misconfigured for <white><world></white>. Please tell an administrator."
+  reload-success: "<prefix><green>Configuration reloaded."
+  reload-failure: "<prefix><red>Reload failed - see the console. The previous configuration is still active."
+  rtpgui-disabled: "<prefix><red>/rtpgui is disabled. Use /rtp."
+  usage: "<prefix><gray>Usage: <white>/rtp [biome <biome> | world <world> | reload]"
+  help:
+    - "<prefix><gradient:green:aqua>BetterRTP commands"
+    - "<gray>/rtp <dark_gray>- <white>open the RTP menu"
+    - "<gray>/rtp biome <biome> <dark_gray>- <white>RTP to a biome"
+    - "<gray>/rtp world <world> <dark_gray>- <white>RTP in a specific world"
+    - "<gray>/rtp reload <dark_gray>- <white>reload the configuration"

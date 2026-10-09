@@ -1,0 +1,33 @@
+name: BetterRTP
+version: '${version}'
+main: com.betterrtp.BetterRTPPlugin
+api-version: '26.2'
+description: Lightweight, safe random teleportation with Java and native Bedrock menus.
+authors: [BetterRTP]
+softdepend: [floodgate, Geyser-Spigot]
+# Commands (/rtp, /rtpgui, /brtp) are registered through Paper's Brigadier lifecycle API.
+permissions:
+  betterrtp.use:
+    description: Use /rtp and the RTP menu.
+    default: true
+  betterrtp.biome:
+    description: Use /rtp biome <biome>.
+    default: op
+  betterrtp.world:
+    description: Use /rtp world <world>.
+    default: op
+  betterrtp.reload:
+    description: Use /rtp reload.
+    default: op
+  betterrtp.bypass.cooldown:
+    description: Ignore the RTP cooldown.
+    default: op
+  betterrtp.admin:
+    description: All BetterRTP permissions.
+    default: op
+    children:
+      betterrtp.use: true
+      betterrtp.biome: true
+      betterrtp.world: true
+      betterrtp.reload: true
+      betterrtp.bypass.cooldown: true
