@@ -19,6 +19,9 @@ public final class RtpRequest {
     private RtpState state = RtpState.COUNTDOWN;
     private int remaining;
     private long queuedAtNanos;
+    private boolean preSearch;          // a search was started together with the countdown
+    private Spot foundSpot;             // safe spot found while the countdown was still running
+    private boolean chunkTicket;        // true while a plugin chunk ticket keeps foundSpot's chunk loaded
 
     public RtpRequest(long id, UUID playerId, String worldName, String label, String biomeKey, UUID startWorld,
                       double startX, double startY, double startZ, int countdownSeconds, int cooldownSeconds) {
@@ -52,6 +55,22 @@ public final class RtpRequest {
     public boolean cancellable() { return state.cancellable(); }
     public long queuedAtNanos() { return queuedAtNanos; }
     public void markQueued(long nanos) { this.queuedAtNanos = nanos; }
+
+
+    /** Marks that a search runs during the countdown (search-during-countdown). */
+    public void enablePreSearch() { this.preSearch = true; }
+    public boolean preSearch() { return preSearch; }
+
+    /** True while a search session may legitimately run for this request. */
+    public boolean searchAllowed() {
+        return state == RtpState.SEARCHING || (state == RtpState.COUNTDOWN && preSearch);
+    }
+
+    public Spot foundSpot() { return foundSpot; }
+    public void setFoundSpot(Spot spot) { this.foundSpot = spot; }
+    public void clearFoundSpot() { this.foundSpot = null; }
+    public boolean chunkTicket() { return chunkTicket; }
+    public void setChunkTicket(boolean held) { this.chunkTicket = held; }
 
     /** Counts one second down; returns the seconds left (0 = countdown finished). */
     public int decrement() {

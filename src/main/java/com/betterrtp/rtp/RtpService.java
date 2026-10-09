@@ -24,7 +24,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.random.RandomGenerator;
 import java.util.logging.Level;
 
 /**
@@ -35,6 +38,12 @@ import java.util.logging.Level;
 public final class RtpService {
     public static final String PERM_USE = "betterrtp.use";
     public static final String PERM_BYPASS = "betterrtp.bypass.cooldown";
+
+    /** Makes the Nether scan start at the top of the allowed range (deterministic re-validation). */
+    private static final RandomGenerator TOP_DOWN = new RandomGenerator() {
+        @Override public long nextLong() { return 0L; }
+        @Override public int nextInt(int bound) { return bound - 1; }
+    };
 
     private final BetterRTPPlugin plugin;
     private final ConfigManager cm;
@@ -186,6 +195,16 @@ public final class RtpService {
         }
         countdowns.add(id);
         effects.showCountdown(p, r);
+        // Last on purpose: a synchronous failure must not leave countdown visuals behind.
+        if (cfg.performance().searchDuringCountdown()) startPreSearch(r, world, settings);
+    }
+
+    /** Starts a slow search that runs together with the countdown (only if a search slot is free). */
+    private void startPreSearch(RtpRequest r, World world, WorldRtpSettings settings) {
+        if (r.state() != RtpState.COUNTDOWN) return;
+        if (activeSearches >= cm.config().performance().maxGlobalSearches()) return;   // falls back to the classic flow
+        r.enablePreSearch();
+        launchSession(r, world, settings);
     }
 
     // ------------------------------------------------------------------ countdown
@@ -208,6 +227,30 @@ public final class RtpService {
         var settings = resolver.settingsFor(r.worldName(), cfg).filter(WorldRtpSettings::enabled);
         if (world == null) { fail(r, Msg.WORLD_UNAVAILABLE); return; }
         if (settings.isEmpty()) { fail(r, Msg.WORLD_DISABLED); return; }
+
+        // 1) A safe spot was already found during the countdown: re-validate it and teleport right away.
+        Spot early = r.foundSpot();
+        if (early != null) {
+            Spot use = revalidate(world, settings.get(), r, early);
+            if (use != null) {
+                if (!r.moveTo(RtpState.SEARCHING)) return;
+                onSearchSuccess(r, world, use);
+                return;
+            }
+            releaseHeldChunk(r);          // the spot is no longer safe: search again at full speed
+            r.clearFoundSpot();
+        }
+
+        // 2) The search started with the countdown is still running: switch it to full speed.
+        RtpSearchSession running = sessions.get(r.playerId());
+        if (running != null) {
+            if (!r.moveTo(RtpState.SEARCHING)) return;
+            messages().send(p, Msg.SEARCHING);
+            running.speedUp();
+            return;
+        }
+
+        // 3) Classic flow: search after the countdown.
         if (activeSearches < cfg.performance().maxGlobalSearches()) {
             startSearch(r, world, settings.get());
         } else if (queue.size() < cfg.performance().maxQueueSize()) {
@@ -227,11 +270,46 @@ public final class RtpService {
         Player p = Bukkit.getPlayer(r.playerId());
         if (p == null) { r.abort(); finishRequest(r); return; }
         messages().send(p, Msg.SEARCHING);
+        launchSession(r, world, settings);
+    }
+
+    /** Creates and starts a search session and takes one global search slot. */
+    private void launchSession(RtpRequest r, World world, WorldRtpSettings settings) {
         NamespacedKey biome = r.biomeKey() == null ? null : NamespacedKey.fromString(r.biomeKey());
         RtpSearchSession s = new RtpSearchSession(plugin, this, r, settings, cm.config(), finder, cache, biome);
         sessions.put(r.playerId(), s);
         activeSearches++;
         s.start();
+    }
+
+    /**
+     * Cheap safety re-check of a spot found earlier during the countdown. If its chunk is not loaded
+     * the spot is trusted (teleportAsync loads it). Returns null when the spot is no longer valid.
+     */
+    private Spot revalidate(World world, WorldRtpSettings settings, RtpRequest r, Spot spot) {
+        if (!world.isChunkLoaded(spot.x() >> 4, spot.z() >> 4)) return spot;
+        try {
+            if (!finder.bounds(world, settings).contains(spot.x(), spot.z())) return null;
+            Optional<Spot> again = finder.evaluate(world, spot.x(), spot.z(), settings, TOP_DOWN);
+            if (again.isEmpty()) return null;
+            if (r.biomeKey() != null) {
+                NamespacedKey wanted = NamespacedKey.fromString(r.biomeKey());
+                if (wanted != null && !finder.biomeMatches(world, again.get(), wanted)) return null;
+            }
+            return again.get();
+        } catch (RuntimeException e) {
+            plugin.getLogger().log(Level.WARNING, "Unexpected error while re-validating an RTP spot", e);
+            return null;
+        }
+    }
+
+    /** Removes the chunk ticket that kept the pre-found spot loaded (idempotent). */
+    private void releaseHeldChunk(RtpRequest r) {
+        if (!r.chunkTicket()) return;
+        r.setChunkTicket(false);
+        Spot s = r.foundSpot();
+        World w = Bukkit.getWorld(r.worldName());
+        if (s != null && w != null) w.removePluginChunkTicket(s.x() >> 4, s.z() >> 4, plugin);
     }
 
     /** Frees the search slot of a request (idempotent) and promotes queued requests. */
@@ -261,10 +339,13 @@ public final class RtpService {
     }
 
     /** Delay between candidates so the whole server stays under max-candidates-per-second. */
-    int candidateDelayTicks() {
-        int perSecond = cm.config().performance().maxCandidatesPerSecond();
-        double ticks = 20.0 * Math.max(1, activeSearches) / perSecond;
-        return (int) Math.max(1, Math.min(40, Math.round(ticks)));
+    int candidateDelayTicks(RtpRequest r) {
+        RtpConfig.Performance perf = cm.config().performance();
+        double ticks = 20.0 * Math.max(1, activeSearches) / perf.maxCandidatesPerSecond();
+        int base = (int) Math.max(1, Math.min(40, Math.round(ticks)));
+        // While the countdown is still running the search is deliberately slower.
+        if (r.state() == RtpState.COUNTDOWN) return Math.min(200, base * perf.countdownSearchSlowdown());
+        return base;
     }
 
     void onSearchFailed(RtpRequest r, Msg reason) {
@@ -274,6 +355,20 @@ public final class RtpService {
     void onSearchSuccess(RtpRequest r, World world, Spot spot) {
         Player p = Bukkit.getPlayer(r.playerId());
         if (p == null || !p.isOnline() || p.isDead()) { r.abort(); finishRequest(r); return; }
+        if (r.state() == RtpState.COUNTDOWN) {
+            // Found early: remember it and wait for the countdown to finish.
+            r.setFoundSpot(spot);
+            try {
+                if (world.addPluginChunkTicket(spot.x() >> 4, spot.z() >> 4, plugin)) r.setChunkTicket(true);
+            } catch (RuntimeException e) {
+                plugin.getLogger().log(Level.WARNING, "Could not hold the chunk of a pre-found RTP spot", e);
+            }
+            if (cm.config().debug()) {
+                plugin.getLogger().info("RTP " + p.getName() + " pre-found " + world.getName() + " " + spot + " during countdown");
+            }
+            releaseSearch(r);
+            return;
+        }
         if (!r.moveTo(RtpState.TELEPORTING)) { finishRequest(r); return; }   // cancelled in the meantime
         releaseSearch(r);
         if (cm.config().debug()) {
@@ -355,6 +450,7 @@ public final class RtpService {
         countdowns.remove(r.playerId());
         effects.clear(r.playerId());
         releaseSearch(r);
+        releaseHeldChunk(r);
         if (active.isEmpty() && movementRegistered) {
             HandlerList.unregisterAll(movementListener);
             movementRegistered = false;

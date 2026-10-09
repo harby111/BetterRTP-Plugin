@@ -32,7 +32,8 @@ final class RtpSearchSession {
     private final LocationCache cache;
     private final NamespacedKey biome;
     private final int maxAttempts;
-    private final long deadlineNanos;
+    private long deadlineNanos;
+    private boolean timed;           // false while searching during the countdown (no time limit yet)
     private final boolean generate;
     private int attempts;
     private long step;
@@ -51,11 +52,28 @@ final class RtpSearchSession {
         this.cache = cache;
         this.biome = biome;
         this.maxAttempts = biome == null ? cfg.safeAttempts() : AreaMath.biomeAttempts(cfg.safeAttempts(), cfg.biome().attemptsMultiplier());
+        // During the countdown only the attempt limit applies; the time limit starts when the search goes full speed.
+        this.timed = request.state() != RtpState.COUNTDOWN;
         this.deadlineNanos = System.nanoTime() + cfg.searchTimeoutSeconds() * 1_000_000_000L;
         this.generate = cfg.preloadChunks() && (biome == null || cfg.biome().generateChunks());
     }
 
     void start() { runNext(); }
+
+    /**
+     * Called when the countdown ended while this search is still running: starts the time limit and,
+     * if the session is just waiting between two candidates, evaluates the next one immediately.
+     */
+    void speedUp() {
+        if (done) return;
+        timed = true;
+        deadlineNanos = System.nanoTime() + cfg.searchTimeoutSeconds() * 1_000_000_000L;
+        if (pending != null) {
+            pending.cancel();
+            pending = null;
+            runNext();
+        }
+    }
 
     void abort() {
         done = true;
@@ -78,8 +96,8 @@ final class RtpSearchSession {
     private void runNext() {
         pending = null;
         if (done) return;
-        if (request.state() != RtpState.SEARCHING) { abort(); return; }
-        if (attempts >= maxAttempts || System.nanoTime() - deadlineNanos >= 0) { fail(Msg.SEARCH_FAILED); return; }
+        if (!request.searchAllowed()) { abort(); return; }
+        if (attempts >= maxAttempts || (timed && System.nanoTime() - deadlineNanos >= 0)) { fail(Msg.SEARCH_FAILED); return; }
         World world = Bukkit.getWorld(request.worldName());
         if (world == null) { fail(Msg.WORLD_UNAVAILABLE); return; }
         Bounds bounds = finder.bounds(world, settings);
@@ -117,7 +135,7 @@ final class RtpSearchSession {
         if (done || my != step) return;      // cancelled, timed out or superseded
         step++;
         if (timeout != null) { timeout.cancel(); timeout = null; }
-        if (request.state() != RtpState.SEARCHING) { abort(); return; }
+        if (!request.searchAllowed()) { abort(); return; }
         if (err != null || chunk == null) { scheduleNext(); return; }
         World world = Bukkit.getWorld(request.worldName());
         if (world == null) { fail(Msg.WORLD_UNAVAILABLE); return; }
@@ -139,6 +157,6 @@ final class RtpSearchSession {
 
     private void scheduleNext() {
         if (done) return;
-        pending = Bukkit.getScheduler().runTaskLater(plugin, this::runNext, service.candidateDelayTicks());
+        pending = Bukkit.getScheduler().runTaskLater(plugin, this::runNext, service.candidateDelayTicks(request));
     }
 }

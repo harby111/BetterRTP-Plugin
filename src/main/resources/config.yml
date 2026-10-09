@@ -104,6 +104,17 @@ performance:
   max-queue-size: 16              # extra requests waiting for a slot; beyond this they fail gracefully
   chunk-load-timeout-ms: 3000     # give up on a candidate chunk after this long
   max-candidates-per-second: 10   # global candidate evaluation rate
+  # false = the search starts only AFTER the countdown ends (classic behaviour).
+  # true  = the search starts together with the countdown, at a reduced speed (see below), so it
+  #         does not stress the CPU. If a safe spot is found before the countdown ends, the player is
+  #         teleported there the moment the countdown finishes. If nothing was found yet when the
+  #         countdown ends, the search switches to full speed. Needs a free search slot
+  #         (max-global-active-searches); otherwise the search starts after the countdown as usual.
+  search-during-countdown: false
+  # Only used when search-during-countdown is true. The delay between two candidates is multiplied
+  # by this value while the countdown is running (1 = same speed as after the countdown, 3 = three
+  # times slower, max 20). Higher = lighter on the server but less likely to finish before the countdown ends.
+  countdown-search-slowdown: 3
 
 # --- Effects ----------------------------------------------------------------
 teleport-sound:

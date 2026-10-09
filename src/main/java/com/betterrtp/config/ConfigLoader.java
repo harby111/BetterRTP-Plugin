@@ -93,7 +93,9 @@ public final class ConfigLoader {
         ConfigurationSection pf = sec(c, "performance");
         Performance perf = new Performance(intRange(pf, "max-global-active-searches", 4, 1, 16),
                 intRange(pf, "max-queue-size", 16, 0, 100), intRange(pf, "chunk-load-timeout-ms", 3000, 250, 30_000),
-                intRange(pf, "max-candidates-per-second", 10, 1, 100));
+                intRange(pf, "max-candidates-per-second", 10, 1, 100),
+                pf.getBoolean("search-during-countdown", false),
+                intRange(pf, "countdown-search-slowdown", 3, 1, 20));
 
         Map<Destination, String> destNames = new EnumMap<>(Destination.class);
         ConfigurationSection dn = sec(c, "destination-names");
