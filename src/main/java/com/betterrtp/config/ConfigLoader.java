@@ -91,10 +91,9 @@ public final class ConfigLoader {
                 nc.getBoolean("enabled", true), intRange(nc, "minimum-open-height", 8, 3, 32));
 
         ConfigurationSection pf = sec(c, "performance");
-        boolean searchDuringCountdown = pf.getBoolean("search-during-countdown", false);
         Performance perf = new Performance(intRange(pf, "max-global-active-searches", 4, 1, 16),
                 intRange(pf, "max-queue-size", 16, 0, 100), intRange(pf, "chunk-load-timeout-ms", 3000, 250, 30_000),
-                intRange(pf, "max-candidates-per-second", 10, 1, 100), searchDuringCountdown);
+                intRange(pf, "max-candidates-per-second", 10, 1, 100));
 
         Map<Destination, String> destNames = new EnumMap<>(Destination.class);
         ConfigurationSection dn = sec(c, "destination-names");
@@ -138,7 +137,7 @@ public final class ConfigLoader {
             if (slot < 0 || slot > 26 || !used.add(slot)) {
                 warn.accept("gui.items." + d.key() + ".slot '" + slot + "' invalid or duplicated; using " + DEFAULT_SLOTS[d.ordinal()]);
                 slot = DEFAULT_SLOTS[d.ordinal()];
-                while (used.contains(slot)) slot = (slot + 1) % 27;
+                while (used.contains(slot)) slot = (slot + 1) % 27;   // first free slot after the default
                 used.add(slot);
             }
             buttons.put(d, new GuiButton(slot, material(i.getString("material"), mats[d.ordinal()], "gui.items." + d.key() + ".material"),
@@ -234,6 +233,7 @@ public final class ConfigLoader {
         return v == null ? def : v;
     }
 
+    /** Never null: an empty detached section when missing, so nested reads need no null checks. */
     private static ConfigurationSection sec(ConfigurationSection parent, String key) {
         ConfigurationSection s = parent.getConfigurationSection(key);
         return s != null ? s : new org.bukkit.configuration.MemoryConfiguration();
@@ -241,10 +241,12 @@ public final class ConfigLoader {
 
     private static String capitalize(String s) { return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1); }
 
+    // Public so RtpEffects can reuse the same mapping.
     public static BossBar.Color bossColor(String name) {
         try { return BossBar.Color.valueOf(name.toUpperCase(Locale.ROOT)); } catch (IllegalArgumentException e) { return null; }
     }
 
+    /** Accepts Bukkit BarStyle names (SOLID, SEGMENTED_10) and Adventure overlay names (PROGRESS, NOTCHED_10). */
     public static BossBar.Overlay bossOverlay(String name) {
         String n = name.toUpperCase(Locale.ROOT);
         if (n.equals("SOLID")) return BossBar.Overlay.PROGRESS;

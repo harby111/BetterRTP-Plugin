@@ -17,6 +17,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.logging.Level;
 
+/**
+ * Bounded, strictly sequential search for ONE request: one candidate (one chunk load) in flight at a time.
+ * Everything runs on the main thread; the chunk callback is hopped back to it. A step token invalidates
+ * late callbacks (timeout, cancellation, abort) so they can never act on stale state.
+ */
 final class RtpSearchSession {
     private final BetterRTPPlugin plugin;
     private final RtpService service;
@@ -29,7 +34,6 @@ final class RtpSearchSession {
     private final int maxAttempts;
     private final long deadlineNanos;
     private final boolean generate;
-    private final boolean earlySearch;
     private int attempts;
     private long step;
     private boolean done;
@@ -37,7 +41,7 @@ final class RtpSearchSession {
     private BukkitTask timeout;
 
     RtpSearchSession(BetterRTPPlugin plugin, RtpService service, RtpRequest request, WorldRtpSettings settings,
-                     RtpConfig cfg, SafeLocationFinder finder, LocationCache cache, NamespacedKey biome, boolean earlySearch) {
+                     RtpConfig cfg, SafeLocationFinder finder, LocationCache cache, NamespacedKey biome) {
         this.plugin = plugin;
         this.service = service;
         this.request = request;
@@ -49,7 +53,6 @@ final class RtpSearchSession {
         this.maxAttempts = biome == null ? cfg.safeAttempts() : AreaMath.biomeAttempts(cfg.safeAttempts(), cfg.biome().attemptsMultiplier());
         this.deadlineNanos = System.nanoTime() + cfg.searchTimeoutSeconds() * 1_000_000_000L;
         this.generate = cfg.preloadChunks() && (biome == null || cfg.biome().generateChunks());
-        this.earlySearch = earlySearch;
     }
 
     void start() { runNext(); }
@@ -75,84 +78,67 @@ final class RtpSearchSession {
     private void runNext() {
         pending = null;
         if (done) return;
-        if (request.state() != RtpState.SEARCHING && request.state() != RtpState.EARLY_SEARCH) { abort(); return; }
+        if (request.state() != RtpState.SEARCHING) { abort(); return; }
         if (attempts >= maxAttempts || System.nanoTime() - deadlineNanos >= 0) { fail(Msg.SEARCH_FAILED); return; }
-        
         World world = Bukkit.getWorld(request.worldName());
         if (world == null) { fail(Msg.WORLD_UNAVAILABLE); return; }
+        Bounds bounds = finder.bounds(world, settings);
+        if (bounds.isEmpty()) { fail(Msg.CONFIG_ERROR); return; }
 
-        OptionalLong cached = cache.poll(request.worldName());
-        if (cached.isPresent()) {
-            int x = LocationCache.unpackX(cached.getAsLong());
-            int z = LocationCache.unpackZ(cached.getAsLong());
-            evaluateSync(world, x, z);
+        int x, z;
+        OptionalLong cached = biome == null ? cache.poll(world.getName()) : OptionalLong.empty();
+        if (cached.isPresent() && bounds.contains(LocationCache.unpackX(cached.getAsLong()), LocationCache.unpackZ(cached.getAsLong()))) {
+            x = LocationCache.unpackX(cached.getAsLong());
+            z = LocationCache.unpackZ(cached.getAsLong());
+        } else {
+            RandomCandidateGenerator.Candidate c = RandomCandidateGenerator.next(bounds, ThreadLocalRandom.current());
+            x = c.x();
+            z = c.z();
+        }
+        attempts++;
+        final long my = ++step;
+        final int fx = x, fz = z;
+        long timeoutTicks = Math.max(1L, cfg.performance().chunkLoadTimeoutMs() / 50L);
+        timeout = Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            if (!done && my == step) { step++; scheduleNext(); }
+        }, timeoutTicks);
+        CompletableFuture<Chunk> future;
+        try {
+            future = world.getChunkAtAsync(fx >> 4, fz >> 4, generate);
+        } catch (RuntimeException e) {
+            plugin.getLogger().log(Level.WARNING, "Chunk request failed", e);
+            fail(Msg.SEARCH_FAILED);
             return;
         }
-
-        int[] bounds = {0,0,0,0};
-        int x = 0, z = 0;
-        if (biome == null) {
-            Bounds b = finder.bounds(world, settings);
-            x = ThreadLocalRandom.current().nextInt(b.minX(), b.maxX() + 1);
-            z = ThreadLocalRandom.current().nextInt(b.minZ(), b.maxZ() + 1);
-        } else {
-            x = ThreadLocalRandom.current().nextInt(-10000, 10000);
-            z = ThreadLocalRandom.current().nextInt(-10000, 10000);
-        }
-        
-        final long myStep = ++step;
-        attempts++;
-        
-        if (generate) {
-            CompletableFuture<Chunk> fut = world.getChunkAtAsync(x >> 4, z >> 4, true);
-            long timeoutMs = cfg.performance().chunkLoadTimeoutMs();
-            if (timeout != null) timeout.cancel();
-            timeout = Bukkit.getScheduler().runTaskLater(plugin, () -> {
-                if (myStep == step && !done) fut.cancel(true);
-            }, (timeoutMs + 50) / 50);
-            
-            fut.whenComplete((chunk, err) -> {
-                if (err != null || chunk == null) {
-                    Threads.main(plugin, () -> { if (myStep == step && !done) fail(Msg.SEARCH_FAILED); });
-                    return;
-                }
-                Threads.main(plugin, () -> {
-                    if (myStep != step || done) return;
-                    if (timeout != null) { timeout.cancel(); timeout = null; }
-                    evaluateSync(world, x, z);
-                });
-            });
-        } else {
-            Chunk c = world.getChunkAt(x >> 4, z >> 4, false);
-            if (c == null || !c.isLoaded()) {
-                long delayTicks = service.candidateDelayTicksForRequest(request);
-                pending = Bukkit.getScheduler().runTaskLater(plugin, this::runNext, delayTicks);
-                return;
-            }
-            evaluateSync(world, x, z);
-        }
+        future.whenComplete((chunk, err) -> Threads.main(plugin, () -> onChunk(my, fx, fz, chunk, err)));
     }
 
-    private void evaluateSync(World world, int x, int z) {
-        if (done) return;
-        if (biome != null) {
-            var bio = world.getBiome(x, 64, z);
-            if (!biome.equals(bio.getKey())) {
-                long delayTicks = service.candidateDelayTicksForRequest(request);
-                pending = Bukkit.getScheduler().runTaskLater(plugin, this::runNext, delayTicks);
-                return;
+    private void onChunk(long my, int x, int z, Chunk chunk, Throwable err) {
+        if (done || my != step) return;      // cancelled, timed out or superseded
+        step++;
+        if (timeout != null) { timeout.cancel(); timeout = null; }
+        if (request.state() != RtpState.SEARCHING) { abort(); return; }
+        if (err != null || chunk == null) { scheduleNext(); return; }
+        World world = Bukkit.getWorld(request.worldName());
+        if (world == null) { fail(Msg.WORLD_UNAVAILABLE); return; }
+        try {
+            if (finder.bounds(world, settings).contains(x, z)) {
+                Optional<Spot> spot = finder.evaluate(world, x, z, settings, ThreadLocalRandom.current());
+                if (spot.isPresent() && (biome == null || finder.biomeMatches(world, spot.get(), biome))) {
+                    done = true;
+                    cancelTasks();
+                    service.onSearchSuccess(request, world, spot.get());
+                    return;
+                }
             }
+        } catch (RuntimeException e) {
+            plugin.getLogger().log(Level.WARNING, "Unexpected error while evaluating an RTP candidate", e);
         }
-        finder.evaluate(world, x, z, settings, ThreadLocalRandom.current()).ifPresent(spot -> {
-            if (earlySearch) {
-                service.onEarlySearchSuccess(request, world, spot);
-            } else {
-                service.onSearchSuccess(request, world, spot);
-            }
-            return;
-        });
+        scheduleNext();
+    }
+
+    private void scheduleNext() {
         if (done) return;
-        long delayTicks = service.candidateDelayTicksForRequest(request);
-        pending = Bukkit.getScheduler().runTaskLater(plugin, this::runNext, delayTicks);
+        pending = Bukkit.getScheduler().runTaskLater(plugin, this::runNext, service.candidateDelayTicks());
     }
 }
