@@ -3,371 +3,390 @@ package com.betterrtp.rtp;
 import com.betterrtp.BetterRTPPlugin;
 import com.betterrtp.config.ConfigManager;
 import com.betterrtp.config.Messages;
-import com.betterrtp.config.Msg;
-import com.betterrtp.config.RtpConfig;
-import com.betterrtp.config.WorldRtpSettings;
-import com.betterrtp.effect.RtpEffects;
-import com.betterrtp.gui.BedrockRtpGui;
-import com.betterrtp.gui.JavaRtpGui;
-import com.betterrtp.listener.RtpMovementListener;
-import com.betterrtp.util.Threads;
-import org.bukkit.Bukkit;
 import org.bukkit.Location;
-import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
-import org.bukkit.event.HandlerList;
-import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
-import java.util.logging.Level;
 
-/**
- * Orchestrates every RTP request: validation, countdown, bounded search with global backpressure,
- * final teleport, cooldown. Main-thread only. A request can never teleport after it was cancelled
- * because every continuation re-checks the request's state machine.
- */
-public final class RtpService {
-    public static final String PERM_USE = "betterrtp.use";
-    public static final String PERM_BYPASS = "betterrtp.bypass.cooldown";
+public class RtpService {
 
     private final BetterRTPPlugin plugin;
-    private final ConfigManager cm;
-    private final Map<UUID, RtpRequest> active = new HashMap<>();
-    private final Map<UUID, RtpSearchSession> sessions = new HashMap<>();
-    private final ArrayDeque<RtpRequest> queue = new ArrayDeque<>();
-    private final CooldownManager cooldowns = new CooldownManager();
-    private final WorldResolver resolver = new WorldResolver();
-    private final LocationCache cache = new LocationCache();
-    private final CacheFiller filler;
-    private final CountdownManager countdowns;
-    private final RtpMovementListener movementListener;
-    private RtpEffects effects;
-    private SafeLocationFinder finder;
-    private JavaRtpGui javaGui;
-    private BedrockRtpGui bedrockGui;
-    private BukkitTask refillTask;
-    private boolean movementRegistered;
-    private long nextId;
-    private int activeSearches;
+    private final SafeLocationFinder locationFinder;
 
-    public RtpService(BetterRTPPlugin plugin, ConfigManager cm) {
+    // يستخدم للنظام القديم
+    private final Map<UUID, BukkitTask> pendingTeleports = new HashMap<>();
+
+    // يستخدم للنظام الجديد: البحث أثناء العد التنازلي
+    private final Map<UUID, RtpSession> activeSessions = new HashMap<>();
+
+    public RtpService(BetterRTPPlugin plugin) {
         this.plugin = plugin;
-        this.cm = cm;
-        this.filler = new CacheFiller(plugin, cache);
-        this.countdowns = new CountdownManager(plugin, this::tickCountdown);
-        this.movementListener = new RtpMovementListener(this, cm);
-        rebuild();
+        this.locationFinder = new SafeLocationFinder(plugin);
     }
 
-    // ------------------------------------------------------------------ lifecycle
+    public void executeRtp(Player player) {
+        UUID uuid = player.getUniqueId();
 
-    /** (Re)builds everything derived from the configuration. Active requests must be cancelled first. */
-    private void rebuild() {
-        RtpConfig cfg = cm.config();
-        Messages msgs = cm.messages();
-        if (effects != null) effects.shutdown();
-        effects = new RtpEffects(cfg, msgs);
-        finder = new SafeLocationFinder(new SafetyChecker(cfg.safety(), cfg.blacklist(), new HazardCatalog()));
-        javaGui = new JavaRtpGui(this, cm);
-        bedrockGui = new BedrockRtpGui(plugin, this, cm);
-        cache.configure(cfg.cache().enabled() ? cfg.cache().size() : 0);
-        cache.clear();
-        if (refillTask != null) { refillTask.cancel(); refillTask = null; }
-        if (cache.enabled()) {
-            long iv = cfg.cache().refillIntervalTicks();
-            refillTask = Bukkit.getScheduler().runTaskTimer(plugin, this::refillTick, iv, iv);
-        }
-    }
-
-    public void applyConfig() {
-        cancelAll(Msg.CANCELLED_RELOAD);
-        rebuild();
-    }
-
-    public void shutdown() {
-        for (RtpRequest r : new ArrayList<>(active.values())) {
-            r.abort();
-            finishRequest(r);
-        }
-        countdowns.clear();
-        if (refillTask != null) { refillTask.cancel(); refillTask = null; }
-        effects.shutdown();
-        cache.clear();
-    }
-
-    // ------------------------------------------------------------------ public entry points
-
-    public RtpRequest activeFor(UUID id) { return active.get(id); }
-    public WorldResolver resolver() { return resolver; }
-    public RtpConfig config() { return cm.config(); }
-    public Messages messages() { return cm.messages(); }
-    public CooldownManager cooldowns() { return cooldowns; }
-
-    /** Opens the Bedrock form or Java inventory. {@code force} ignores open-on-rtp (used by /rtpgui). */
-    public void openMenu(Player p, boolean force) {
-        RtpConfig cfg = cm.config();
-        if (!p.hasPermission(PERM_USE)) { messages().send(p, Msg.NO_PERMISSION); return; }
-        if (!force && !cfg.openOnRtp()) { startDestination(p, Destination.OVERWORLD); return; }
-        if (active.containsKey(p.getUniqueId())) { messages().send(p, Msg.ALREADY_IN_PROGRESS); return; }
-        if (cooldownBlocks(p)) return;
-        if (cfg.bedrockGui().enabled() && plugin.bedrock().isBedrock(p.getUniqueId())) {
-            if (bedrockGui.open(p)) return;
-            messages().send(p, Msg.BEDROCK_UNAVAILABLE);
-        }
-        javaGui.open(p);
-    }
-
-    public void startDestination(Player p, Destination d) {
-        RtpConfig cfg = cm.config();
-        var resolved = resolver.resolve(d, cfg);
-        if (resolved.isEmpty()) {
-            messages().send(p, Msg.DESTINATION_UNAVAILABLE, Messages.p("destination", cfg.destinationNames().get(d)));
+        if (!player.hasPermission("betterrtp.admin") && plugin.getCooldownManager().hasCooldown(uuid)) {
+            long remaining = plugin.getCooldownManager().getRemainingCooldown(uuid);
+            player.sendMessage(Messages.get("cooldown").replace("%time%", String.valueOf(remaining)));
             return;
         }
-        begin(p, resolved.get().world(), resolved.get().settings(), cfg.destinationNames().get(d), null);
-    }
 
-    public void startWorld(Player p, String worldName) {
-        RtpConfig cfg = cm.config();
-        WorldResolver.Lookup l = resolver.byName(worldName, cfg);
-        switch (l.status()) {
-            case NOT_FOUND -> messages().send(p, Msg.INVALID_WORLD, Messages.p("world", worldName));
-            case DISABLED -> messages().send(p, Msg.WORLD_DISABLED, Messages.p("world", worldName));
-            case OK -> begin(p, l.resolved().world(), l.resolved().settings(), l.resolved().world().getName(), null);
-        }
-    }
+        // إلغاء أي عملية RTP سابقة للاعب نفسه
+        cancelPending(uuid);
 
-    public void startBiome(Player p, NamespacedKey biome) {
-        RtpConfig cfg = cm.config();
-        if (!cfg.biome().enabled()) { messages().send(p, Msg.BIOME_DISABLED); return; }
-        // Current world if it is an enabled RTP world, otherwise the resolved Overworld.
-        var current = resolver.settingsFor(p.getWorld().getName(), cfg).filter(WorldRtpSettings::enabled);
-        if (current.isPresent()) {
-            begin(p, p.getWorld(), current.get(), biome.getKey(), biome);
-            return;
-        }
-        var ow = resolver.resolve(Destination.OVERWORLD, cfg);
-        if (ow.isEmpty()) {
-            messages().send(p, Msg.DESTINATION_UNAVAILABLE, Messages.p("destination", cfg.destinationNames().get(Destination.OVERWORLD)));
-            return;
-        }
-        begin(p, ow.get().world(), ow.get().settings(), biome.getKey(), biome);
-    }
+        ConfigManager config = plugin.getConfigManager();
+        int delay = config.getTeleportDelaySeconds();
+        boolean bypassDelay = delay <= 0 || player.hasPermission("betterrtp.bypass.delay");
 
-    // ------------------------------------------------------------------ request start
-
-    private boolean cooldownBlocks(Player p) {
-        if (p.hasPermission(PERM_BYPASS)) return false;
-        long rem = cooldowns.remainingSeconds(p.getUniqueId());
-        if (rem <= 0) return false;
-        messages().send(p, Msg.COOLDOWN, Messages.p("time", CooldownManager.format(rem)), Messages.p("seconds", rem));
-        return true;
-    }
-
-    private void begin(Player p, World world, WorldRtpSettings settings, String label, NamespacedKey biome) {
-        UUID id = p.getUniqueId();
-        if (!p.hasPermission(PERM_USE)) { messages().send(p, Msg.NO_PERMISSION); return; }
-        if (active.containsKey(id)) { messages().send(p, Msg.ALREADY_IN_PROGRESS); return; }
-        if (cooldownBlocks(p)) return;
-        RtpConfig cfg = cm.config();
-        Location l = p.getLocation();
-        RtpRequest r = new RtpRequest(++nextId, id, world.getName(), label, biome == null ? null : biome.toString(),
-                l.getWorld().getUID(), l.getX(), l.getY(), l.getZ(), cfg.countdownSeconds(), settings.cooldownSeconds());
-        active.put(id, r);
-        if (!movementRegistered && cfg.cancelOnMove()) {
-            Bukkit.getPluginManager().registerEvents(movementListener, plugin);
-            movementRegistered = true;
-        }
-        countdowns.add(id);
-        effects.showCountdown(p, r);
-    }
-
-    // ------------------------------------------------------------------ countdown
-
-    private void tickCountdown(UUID id) {
-        RtpRequest r = active.get(id);
-        if (r == null || r.state() != RtpState.COUNTDOWN) { countdowns.remove(id); return; }
-        Player p = Bukkit.getPlayer(id);
-        if (p == null || !p.isOnline() || p.isDead()) { r.abort(); finishRequest(r); return; }
-        if (r.decrement() > 0) { effects.showCountdown(p, r); return; }
-        countdowns.remove(id);
-        effects.clear(id);
-        effects.clearActionbar(p);
-        onCountdownDone(p, r);
-    }
-
-    private void onCountdownDone(Player p, RtpRequest r) {
-        RtpConfig cfg = cm.config();
-        World world = Bukkit.getWorld(r.worldName());
-        var settings = resolver.settingsFor(r.worldName(), cfg).filter(WorldRtpSettings::enabled);
-        if (world == null) { fail(r, Msg.WORLD_UNAVAILABLE); return; }
-        if (settings.isEmpty()) { fail(r, Msg.WORLD_DISABLED); return; }
-        if (activeSearches < cfg.performance().maxGlobalSearches()) {
-            startSearch(r, world, settings.get());
-        } else if (queue.size() < cfg.performance().maxQueueSize()) {
-            r.moveTo(RtpState.QUEUED);
-            r.markQueued(System.nanoTime());
-            queue.addLast(r);
-            messages().send(p, Msg.QUEUED);
+        // إذا كان الوضع الجديد مفعلًا ولا يوجد تجاوز للتأخير، نستخدم البحث أثناء العد
+        if (config.isSearchDuringCountdown() && !bypassDelay) {
+            startSearchDuringCountdown(player, delay);
         } else {
-            fail(r, Msg.BUSY);
+            // النظام القديم: البحث أولًا ثم العد أو النقل الفوري
+            executeLegacyRtp(player, delay, bypassDelay);
         }
     }
 
-    // ------------------------------------------------------------------ search
+    /*
+     * النظام القديم:
+     * يبحث عن الموقع أولًا، وبعد إيجاد الموقع يبدأ العد التنازلي.
+     */
+    private void executeLegacyRtp(Player player, int delay, boolean bypassDelay) {
+        player.sendMessage(Messages.get("teleporting"));
 
-    private void startSearch(RtpRequest r, World world, WorldRtpSettings settings) {
-        if (!r.moveTo(RtpState.SEARCHING)) return;
-        Player p = Bukkit.getPlayer(r.playerId());
-        if (p == null) { r.abort(); finishRequest(r); return; }
-        messages().send(p, Msg.SEARCHING);
-        NamespacedKey biome = r.biomeKey() == null ? null : NamespacedKey.fromString(r.biomeKey());
-        RtpSearchSession s = new RtpSearchSession(plugin, this, r, settings, cm.config(), finder, cache, biome);
-        sessions.put(r.playerId(), s);
-        activeSearches++;
-        s.start();
-    }
+        locationFinder.findSafeLocation(player.getWorld()).thenAccept(location -> {
+            if (!player.isOnline()) {
+                return;
+            }
 
-    /** Frees the search slot of a request (idempotent) and promotes queued requests. */
-    private void releaseSearch(RtpRequest r) {
-        RtpSearchSession s = sessions.remove(r.playerId());
-        if (s != null) {
-            s.abort();
-            activeSearches = Math.max(0, activeSearches - 1);
-        }
-        queue.remove(r);
-        pump();
-    }
+            if (location == null) {
+                player.sendMessage(Messages.get("no-safe-location"));
+                return;
+            }
 
-    private void pump() {
-        RtpConfig cfg = cm.config();
-        long maxWait = cfg.searchTimeoutSeconds() * 1_000_000_000L;
-        while (activeSearches < cfg.performance().maxGlobalSearches() && !queue.isEmpty()) {
-            RtpRequest r = queue.pollFirst();
-            if (r.state() != RtpState.QUEUED) continue;
-            if (System.nanoTime() - r.queuedAtNanos() > maxWait) { fail(r, Msg.BUSY); continue; }
-            World world = Bukkit.getWorld(r.worldName());
-            var settings = resolver.settingsFor(r.worldName(), cfg).filter(WorldRtpSettings::enabled);
-            if (world == null) { fail(r, Msg.WORLD_UNAVAILABLE); continue; }
-            if (settings.isEmpty()) { fail(r, Msg.WORLD_DISABLED); continue; }
-            startSearch(r, world, settings.get());
-        }
-    }
-
-    /** Delay between candidates so the whole server stays under max-candidates-per-second. */
-    int candidateDelayTicks() {
-        int perSecond = cm.config().performance().maxCandidatesPerSecond();
-        double ticks = 20.0 * Math.max(1, activeSearches) / perSecond;
-        return (int) Math.max(1, Math.min(40, Math.round(ticks)));
-    }
-
-    void onSearchFailed(RtpRequest r, Msg reason) {
-        fail(r, reason);
-    }
-
-    void onSearchSuccess(RtpRequest r, World world, Spot spot) {
-        Player p = Bukkit.getPlayer(r.playerId());
-        if (p == null || !p.isOnline() || p.isDead()) { r.abort(); finishRequest(r); return; }
-        if (!r.moveTo(RtpState.TELEPORTING)) { finishRequest(r); return; }   // cancelled in the meantime
-        releaseSearch(r);
-        if (cm.config().debug()) {
-            plugin.getLogger().info("RTP " + p.getName() + " -> " + world.getName() + " " + spot);
-        }
-        Location dest = new Location(world, spot.x() + 0.5, spot.y(), spot.z() + 0.5, p.getLocation().getYaw(), p.getLocation().getPitch());
-        try {
-            p.teleportAsync(dest, PlayerTeleportEvent.TeleportCause.COMMAND).whenComplete((ok, err) ->
-                    Threads.main(plugin, () -> afterTeleport(r, dest, Boolean.TRUE.equals(ok) && err == null, err)));
-        } catch (RuntimeException e) {
-            plugin.getLogger().log(Level.WARNING, "teleportAsync threw", e);
-            afterTeleport(r, dest, false, e);
-        }
-    }
-
-    private void afterTeleport(RtpRequest r, Location dest, boolean success, Throwable err) {
-        if (!r.moveTo(success ? RtpState.COMPLETED : RtpState.FAILED)) { finishRequest(r); return; }
-        Player p = Bukkit.getPlayer(r.playerId());
-        if (err != null) plugin.getLogger().log(Level.WARNING, "Teleport failed unexpectedly", err);
-        if (p != null && p.isOnline()) {
-            if (success) {
-                if (!p.hasPermission(PERM_BYPASS)) cooldowns.apply(r.playerId(), r.cooldownSeconds());
-                effects.playTeleport(p);
-                messages().send(p, Msg.TELEPORT_SUCCESS, Messages.p("x", dest.getBlockX()), Messages.p("y", dest.getBlockY()),
-                        Messages.p("z", dest.getBlockZ()), Messages.p("world", dest.getWorld().getName()));
+            if (bypassDelay) {
+                teleportNow(player, location);
             } else {
-                messages().send(p, Msg.TELEPORT_FAILED);
+                startTeleportCountdown(player, location, delay);
+            }
+        });
+    }
+
+    /*
+     * النظام الجديد:
+     * يبدأ العد التنازلي مباشرة، ويبدأ البحث عن موقع آمن بسرعة خفيفة.
+     */
+    private void startSearchDuringCountdown(Player player, int delay) {
+        World world = player.getWorld();
+        SafeLocationFinder.Bounds bounds = locationFinder.getBounds(world);
+
+        RtpSession session = new RtpSession(
+                player,
+                world,
+                bounds,
+                Math.max(1, plugin.getConfigManager().getMaxAttempts())
+        );
+
+        activeSessions.put(player.getUniqueId(), session);
+
+        player.sendMessage(Messages.get("teleporting"));
+
+        ConfigManager config = plugin.getConfigManager();
+
+        startSessionSearch(
+                session,
+                config.getSearchIntervalTicks(),
+                config.getAttemptsPerInterval()
+        );
+
+        startSessionCountdown(session, delay);
+    }
+
+    /*
+     * تشغيل مهمة البحث الخاصة بالجلسة.
+     * يمكن تشغيلها بسرعة عادية أثناء العد، أو بسرعة أعلى بعد انتهاء العد.
+     */
+    private void startSessionSearch(RtpSession session, int intervalTicks, int attemptsPerInterval) {
+        if (session.searchTask != null) {
+            session.searchTask.cancel();
+        }
+
+        final int interval = Math.max(1, intervalTicks);
+        final int attemptsPerStep = Math.max(1, attemptsPerInterval);
+
+        session.searchTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                UUID uuid = session.player.getUniqueId();
+
+                if (!activeSessions.containsKey(uuid) || activeSessions.get(uuid) != session) {
+                    cancel();
+                    return;
+                }
+
+                if (!session.player.isOnline()) {
+                    cancelPending(uuid);
+                    return;
+                }
+
+                if (session.foundLocation != null || session.searchFailed) {
+                    cancel();
+                    return;
+                }
+
+                for (int i = 0; i < attemptsPerStep; i++) {
+                    if (session.attemptsUsed >= session.maxAttempts) {
+                        session.searchFailed = true;
+                        break;
+                    }
+
+                    session.attemptsUsed++;
+
+                    Location location = locationFinder.attemptSafeLocation(session.world, session.bounds);
+
+                    if (location != null) {
+                        session.foundLocation = location;
+                        break;
+                    }
+                }
+
+                // إذا وجدنا موقعًا
+                if (session.foundLocation != null) {
+                    cancel();
+
+                    // إذا كان العد التنازلي قد انتهى، ننقل اللاعب مباشرة.
+                    // أما إذا لم ينته، ننتظر حتى ينتهي العد.
+                    if (session.countdownFinished) {
+                        completeSessionWithLocation(session);
+                    }
+
+                    return;
+                }
+
+                // إذا فشلت كل المحاولات
+                if (session.searchFailed) {
+                    cancel();
+                    handleSearchFailure(session);
+                }
+            }
+        }.runTaskTimer(plugin, 0L, interval);
+    }
+
+    /*
+     * العد التنازلي للنظام الجديد.
+     */
+    private void startSessionCountdown(RtpSession session, int delay) {
+        session.countdownTask = new BukkitRunnable() {
+            private int count = delay;
+
+            @Override
+            public void run() {
+                UUID uuid = session.player.getUniqueId();
+
+                if (!activeSessions.containsKey(uuid) || activeSessions.get(uuid) != session) {
+                    cancel();
+                    return;
+                }
+
+                if (!session.player.isOnline()) {
+                    cancelPending(uuid);
+                    return;
+                }
+
+                if (count <= 0) {
+                    cancel();
+
+                    session.countdownFinished = true;
+
+                    // إذا كان الموقع قد تم إيجاده قبل نهاية العد
+                    if (session.foundLocation != null) {
+                        completeSessionWithLocation(session);
+                        return;
+                    }
+
+                    // إذا كان البحث قد فشل نهائيًا
+                    if (session.searchFailed) {
+                        handleSearchFailure(session);
+                        return;
+                    }
+
+                    // إذا انتهى العد ولم نجد موقعًا بعد، نسرّع البحث إن كان الخيار مفعلًا
+                    ConfigManager config = plugin.getConfigManager();
+
+                    if (config.isBoostSearchAfterCountdown()) {
+                        startSessionSearch(
+                                session,
+                                config.getBoostIntervalTicks(),
+                                config.getBoostAttemptsPerInterval()
+                        );
+                    }
+
+                    return;
+                }
+
+                count--;
+            }
+        }.runTaskTimer(plugin, 0L, 20L);
+    }
+
+    /*
+     * إنهاء الجلسة ونقل اللاعب بعد إيجاد موقع آمن.
+     */
+    private void completeSessionWithLocation(RtpSession session) {
+        activeSessions.remove(session.player.getUniqueId());
+
+        if (session.countdownTask != null) {
+            session.countdownTask.cancel();
+        }
+
+        if (session.searchTask != null) {
+            session.searchTask.cancel();
+        }
+
+        if (session.player.isOnline() && session.foundLocation != null) {
+            teleportNow(session.player, session.foundLocation);
+        }
+    }
+
+    /*
+     * إنهاء الجلسة عند الفشل في إيجاد موقع آمن.
+     */
+    private void handleSearchFailure(RtpSession session) {
+        activeSessions.remove(session.player.getUniqueId());
+
+        if (session.countdownTask != null) {
+            session.countdownTask.cancel();
+        }
+
+        if (session.searchTask != null) {
+            session.searchTask.cancel();
+        }
+
+        if (session.player.isOnline()) {
+            session.player.sendMessage(Messages.get("no-safe-location"));
+        }
+    }
+
+    private void teleportNow(Player player, Location location) {
+        player.teleportAsync(location).thenAccept(success -> {
+            if (success && player.isOnline()) {
+                plugin.getCooldownManager().setCooldown(
+                        player.getUniqueId(),
+                        plugin.getConfigManager().getCooldownSeconds()
+                );
+
+                String msg = Messages.get("success")
+                        .replace("%x%", String.valueOf(location.getBlockX()))
+                        .replace("%y%", String.valueOf(location.getBlockY()))
+                        .replace("%z%", String.valueOf(location.getBlockZ()))
+                        .replace("%world%", location.getWorld().getName());
+
+                player.sendMessage(msg);
+            }
+        });
+    }
+
+    /*
+     * العد التنازلي للنظام القديم.
+     */
+    private void startTeleportCountdown(Player player, Location targetLoc, int delay) {
+        cancelPending(player.getUniqueId());
+
+        BukkitTask task = new BukkitRunnable() {
+            private int count = delay;
+
+            @Override
+            public void run() {
+                if (!player.isOnline()) {
+                    cancelPending(player.getUniqueId());
+                    cancel();
+                    return;
+                }
+
+                if (count <= 0) {
+                    pendingTeleports.remove(player.getUniqueId());
+                    teleportNow(player, targetLoc);
+                    cancel();
+                    return;
+                }
+
+                count--;
+            }
+        }.runTaskTimer(plugin, 0L, 20L);
+
+        pendingTeleports.put(player.getUniqueId(), task);
+    }
+
+    public void cancelPending(UUID uuid) {
+        // إلغاء النظام القديم
+        BukkitTask oldTask = pendingTeleports.remove(uuid);
+        if (oldTask != null) {
+            oldTask.cancel();
+        }
+
+        // إلغاء النظام الجديد
+        RtpSession session = activeSessions.remove(uuid);
+        if (session != null) {
+            if (session.countdownTask != null) {
+                session.countdownTask.cancel();
+            }
+
+            if (session.searchTask != null) {
+                session.searchTask.cancel();
             }
         }
-        finishRequest(r);
     }
 
-    // ------------------------------------------------------------------ cancel / fail / cleanup
-
-    /** Cancels if still cancellable. @return true if it was cancelled. */
-    public boolean cancel(UUID id, Msg reason) {
-        RtpRequest r = active.get(id);
-        if (r == null || !r.moveTo(RtpState.CANCELLED)) return false;
-        Player p = Bukkit.getPlayer(id);
-        finishRequest(r);
-        if (p != null && reason != null) messages().send(p, reason);
-        return true;
+    public boolean isPending(UUID uuid) {
+        return pendingTeleports.containsKey(uuid) || activeSessions.containsKey(uuid);
     }
 
-    /** Silent hard stop (disconnect, death). Also stops requests whose teleport is in flight. */
-    public void abort(UUID id) {
-        RtpRequest r = active.get(id);
-        if (r == null) return;
-        r.abort();
-        finishRequest(r);
+    public void cancelAllTasks() {
+        pendingTeleports.values().forEach(BukkitTask::cancel);
+        pendingTeleports.clear();
+
+        activeSessions.values().forEach(session -> {
+            if (session.countdownTask != null) {
+                session.countdownTask.cancel();
+            }
+
+            if (session.searchTask != null) {
+                session.searchTask.cancel();
+            }
+        });
+
+        activeSessions.clear();
     }
 
-    private void fail(RtpRequest r, Msg reason) {
-        if (!r.moveTo(RtpState.FAILED)) return;
-        Player p = Bukkit.getPlayer(r.playerId());
-        finishRequest(r);
-        if (p != null && p.isOnline() && reason != null) {
-            messages().send(p, reason, Messages.p("world", r.worldName()));
-        }
-    }
+    /*
+     * جلسة RTP للنظام الجديد.
+     */
+    private static final class RtpSession {
+        private final Player player;
+        private final World world;
+        private final SafeLocationFinder.Bounds bounds;
+        private final int maxAttempts;
 
-    public void cancelAll(Msg reason) {
-        for (RtpRequest r : new ArrayList<>(active.values())) {
-            if (r.cancellable()) cancel(r.playerId(), reason);
-        }
-        queue.clear();
-    }
+        private BukkitTask countdownTask;
+        private BukkitTask searchTask;
 
-    public void onWorldUnload(World world) {
-        for (RtpRequest r : new ArrayList<>(active.values())) {
-            if (r.worldName().equals(world.getName()) && r.cancellable()) cancel(r.playerId(), Msg.CANCELLED_WORLD_UNLOADED);
-        }
-        cache.clear(world.getName());
-    }
+        private Location foundLocation;
+        private boolean countdownFinished;
+        private boolean searchFailed;
+        private int attemptsUsed;
 
-    /** Idempotent: removes every trace of the request. */
-    private void finishRequest(RtpRequest r) {
-        active.remove(r.playerId(), r);
-        countdowns.remove(r.playerId());
-        effects.clear(r.playerId());
-        releaseSearch(r);
-        if (active.isEmpty() && movementRegistered) {
-            HandlerList.unregisterAll(movementListener);
-            movementRegistered = false;
-        }
-    }
-
-    // ------------------------------------------------------------------ optional cache
-
-    private void refillTick() {
-        if (Bukkit.getOnlinePlayers().isEmpty() || activeSearches > 0 || !queue.isEmpty()) return;
-        RtpConfig cfg = cm.config();
-        for (Destination d : Destination.values()) {
-            resolver.resolve(d, cfg).ifPresent(res -> filler.fill(res.world(), res.settings(), cfg, finder));
+        private RtpSession(Player player, World world, SafeLocationFinder.Bounds bounds, int maxAttempts) {
+            this.player = player;
+            this.world = world;
+            this.bounds = bounds;
+            this.maxAttempts = maxAttempts;
         }
     }
 }
