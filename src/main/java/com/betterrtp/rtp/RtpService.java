@@ -27,11 +27,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.logging.Level;
 
-/**
- * Orchestrates every RTP request: validation, countdown, bounded search with global backpressure,
- * final teleport, cooldown. Main-thread only. A request can never teleport after it was cancelled
- * because every continuation re-checks the request's state machine.
- */
 public final class RtpService {
     public static final String PERM_USE = "betterrtp.use";
     public static final String PERM_BYPASS = "betterrtp.bypass.cooldown";
@@ -65,9 +60,6 @@ public final class RtpService {
         rebuild();
     }
 
-    // ------------------------------------------------------------------ lifecycle
-
-    /** (Re)builds everything derived from the configuration. Active requests must be cancelled first. */
     private void rebuild() {
         RtpConfig cfg = cm.config();
         Messages msgs = cm.messages();
@@ -101,15 +93,12 @@ public final class RtpService {
         cache.clear();
     }
 
-    // ------------------------------------------------------------------ public entry points
-
     public RtpRequest activeFor(UUID id) { return active.get(id); }
     public WorldResolver resolver() { return resolver; }
     public RtpConfig config() { return cm.config(); }
     public Messages messages() { return cm.messages(); }
     public CooldownManager cooldowns() { return cooldowns; }
 
-    /** Opens the Bedrock form or Java inventory. {@code force} ignores open-on-rtp (used by /rtpgui). */
     public void openMenu(Player p, boolean force) {
         RtpConfig cfg = cm.config();
         if (!p.hasPermission(PERM_USE)) { messages().send(p, Msg.NO_PERMISSION); return; }
@@ -146,7 +135,6 @@ public final class RtpService {
     public void startBiome(Player p, NamespacedKey biome) {
         RtpConfig cfg = cm.config();
         if (!cfg.biome().enabled()) { messages().send(p, Msg.BIOME_DISABLED); return; }
-        // Current world if it is an enabled RTP world, otherwise the resolved Overworld.
         var current = resolver.settingsFor(p.getWorld().getName(), cfg).filter(WorldRtpSettings::enabled);
         if (current.isPresent()) {
             begin(p, p.getWorld(), current.get(), biome.getKey(), biome);
@@ -159,8 +147,6 @@ public final class RtpService {
         }
         begin(p, ow.get().world(), ow.get().settings(), biome.getKey(), biome);
     }
-
-    // ------------------------------------------------------------------ request start
 
     private boolean cooldownBlocks(Player p) {
         if (p.hasPermission(PERM_BYPASS)) return false;
@@ -186,20 +172,59 @@ public final class RtpService {
         }
         countdowns.add(id);
         effects.showCountdown(p, r);
+        
+        if (cfg.performance().searchDuringCountdown()) {
+            startEarlySearch(r);
+        }
     }
 
-    // ------------------------------------------------------------------ countdown
+    private void startEarlySearch(RtpRequest r) {
+        if (!r.moveTo(RtpState.EARLY_SEARCH)) return;
+        Player p = Bukkit.getPlayer(r.playerId());
+        if (p == null) { r.abort(); finishRequest(r); return; }
+        
+        World world = Bukkit.getWorld(r.worldName());
+        var settings = resolver.settingsFor(r.worldName(), cm.config()).filter(WorldRtpSettings::enabled);
+        if (world == null || settings.isEmpty()) {
+            r.moveTo(RtpState.COUNTDOWN, true);
+            return;
+        }
+        
+        messages().send(p, Msg.SEARCHING_EARLY);
+        NamespacedKey biome = r.biomeKey() == null ? null : NamespacedKey.fromString(r.biomeKey());
+        RtpSearchSession s = new RtpSearchSession(plugin, this, r, settings.get(), cm.config(), finder, cache, biome, true);
+        sessions.put(r.playerId(), s);
+        activeSearches++;
+        s.start();
+    }
 
     private void tickCountdown(UUID id) {
         RtpRequest r = active.get(id);
-        if (r == null || r.state() != RtpState.COUNTDOWN) { countdowns.remove(id); return; }
+        if (r == null) { countdowns.remove(id); return; }
+        
         Player p = Bukkit.getPlayer(id);
         if (p == null || !p.isOnline() || p.isDead()) { r.abort(); finishRequest(r); return; }
-        if (r.decrement() > 0) { effects.showCountdown(p, r); return; }
+        
+        if (r.decrement() > 0) { 
+            effects.showCountdown(p, r); 
+            return; 
+        }
+        
         countdowns.remove(id);
         effects.clear(id);
         effects.clearActionbar(p);
-        onCountdownDone(p, r);
+        
+        if (r.earlySpot() != null) {
+            onSearchSuccess(r, r.earlyWorld(), r.earlySpot());
+        } else if (r.state() == RtpState.EARLY_SEARCH) {
+            r.moveTo(RtpState.SEARCHING);
+            r.enableFastMode();
+            messages().send(p, Msg.SEARCHING_ACCELERATED);
+        } else if (r.hasEarlySearchFailed()) {
+            onCountdownDone(p, r);
+        } else {
+            onCountdownDone(p, r);
+        }
     }
 
     private void onCountdownDone(Player p, RtpRequest r) {
@@ -220,21 +245,18 @@ public final class RtpService {
         }
     }
 
-    // ------------------------------------------------------------------ search
-
     private void startSearch(RtpRequest r, World world, WorldRtpSettings settings) {
         if (!r.moveTo(RtpState.SEARCHING)) return;
         Player p = Bukkit.getPlayer(r.playerId());
         if (p == null) { r.abort(); finishRequest(r); return; }
         messages().send(p, Msg.SEARCHING);
         NamespacedKey biome = r.biomeKey() == null ? null : NamespacedKey.fromString(r.biomeKey());
-        RtpSearchSession s = new RtpSearchSession(plugin, this, r, settings, cm.config(), finder, cache, biome);
+        RtpSearchSession s = new RtpSearchSession(plugin, this, r, settings, cm.config(), finder, cache, biome, false);
         sessions.put(r.playerId(), s);
         activeSearches++;
         s.start();
     }
 
-    /** Frees the search slot of a request (idempotent) and promotes queued requests. */
     private void releaseSearch(RtpRequest r) {
         RtpSearchSession s = sessions.remove(r.playerId());
         if (s != null) {
@@ -260,21 +282,39 @@ public final class RtpService {
         }
     }
 
-    /** Delay between candidates so the whole server stays under max-candidates-per-second. */
     int candidateDelayTicks() {
         int perSecond = cm.config().performance().maxCandidatesPerSecond();
         double ticks = 20.0 * Math.max(1, activeSearches) / perSecond;
         return (int) Math.max(1, Math.min(40, Math.round(ticks)));
     }
 
+    int candidateDelayTicksForRequest(RtpRequest r) {
+        if (r.state() == RtpState.EARLY_SEARCH && !r.isFastMode()) {
+            int base = candidateDelayTicks();
+            return Math.min(100, Math.max(5, base * 4));
+        }
+        return candidateDelayTicks();
+    }
+
     void onSearchFailed(RtpRequest r, Msg reason) {
+        if (r.state() == RtpState.EARLY_SEARCH) {
+            r.markEarlySearchFailed();
+            releaseSearch(r);
+            return;
+        }
         fail(r, reason);
+    }
+
+    void onEarlySearchSuccess(RtpRequest r, World world, Spot spot) {
+        if (!r.moveTo(RtpState.SEARCH_DONE_WAITING)) return;
+        r.setEarlySpot(world, spot);
+        releaseSearch(r);
     }
 
     void onSearchSuccess(RtpRequest r, World world, Spot spot) {
         Player p = Bukkit.getPlayer(r.playerId());
         if (p == null || !p.isOnline() || p.isDead()) { r.abort(); finishRequest(r); return; }
-        if (!r.moveTo(RtpState.TELEPORTING)) { finishRequest(r); return; }   // cancelled in the meantime
+        if (!r.moveTo(RtpState.TELEPORTING)) { finishRequest(r); return; }
         releaseSearch(r);
         if (cm.config().debug()) {
             plugin.getLogger().info("RTP " + p.getName() + " -> " + world.getName() + " " + spot);
@@ -306,9 +346,6 @@ public final class RtpService {
         finishRequest(r);
     }
 
-    // ------------------------------------------------------------------ cancel / fail / cleanup
-
-    /** Cancels if still cancellable. @return true if it was cancelled. */
     public boolean cancel(UUID id, Msg reason) {
         RtpRequest r = active.get(id);
         if (r == null || !r.moveTo(RtpState.CANCELLED)) return false;
@@ -318,7 +355,6 @@ public final class RtpService {
         return true;
     }
 
-    /** Silent hard stop (disconnect, death). Also stops requests whose teleport is in flight. */
     public void abort(UUID id) {
         RtpRequest r = active.get(id);
         if (r == null) return;
@@ -349,7 +385,6 @@ public final class RtpService {
         cache.clear(world.getName());
     }
 
-    /** Idempotent: removes every trace of the request. */
     private void finishRequest(RtpRequest r) {
         active.remove(r.playerId(), r);
         countdowns.remove(r.playerId());
@@ -360,8 +395,6 @@ public final class RtpService {
             movementRegistered = false;
         }
     }
-
-    // ------------------------------------------------------------------ optional cache
 
     private void refillTick() {
         if (Bukkit.getOnlinePlayers().isEmpty() || activeSearches > 0 || !queue.isEmpty()) return;

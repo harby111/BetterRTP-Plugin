@@ -42,7 +42,7 @@ public record RtpConfig(
     public record Safety(boolean rejectWater, boolean rejectLava, boolean rejectFire, boolean rejectHazards,
                          boolean rejectUnderground, int verticalClearance, boolean ignoreLeaves,
                          int maxScanHeight, boolean netherEnabled, int netherMinimumOpenHeight) { }
-    public record Performance(int maxGlobalSearches, int maxQueueSize, int chunkLoadTimeoutMs, int maxCandidatesPerSecond) { }
+    public record Performance(int maxGlobalSearches, int maxQueueSize, int chunkLoadTimeoutMs, int maxCandidatesPerSecond, boolean searchDuringCountdown) { }
 
     public record GuiButton(int slot, String material, String name, List<String> lore) { }
     public record Gui(String title, String fillerMaterial, Map<Destination, GuiButton> buttons, GuiButton unavailable) { }
