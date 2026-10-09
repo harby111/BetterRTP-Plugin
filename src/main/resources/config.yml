@@ -104,14 +104,6 @@ performance:
   max-queue-size: 16              # extra requests waiting for a slot; beyond this they fail gracefully
   chunk-load-timeout-ms: 3000     # give up on a candidate chunk after this long
   max-candidates-per-second: 10   # global candidate evaluation rate
-  
-  search-during-countdown: true
-  search-interval-ticks: 3
-  attempts-per-interval: 1
-  
-  boost-search-after-countdown: true
-  boost-interval-ticks: 1
-  boost-attempts-per-interval: 4
 
 # --- Effects ----------------------------------------------------------------
 teleport-sound:
