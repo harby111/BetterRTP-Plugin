@@ -208,16 +208,16 @@ bedrock-gui:
   buttons:
     overworld:
       enabled: true
-      text: "🌱 Overworld"
-      image: { enabled: false, type: "PATH", data: "" }   # type: PATH or URL
+      text: "Overworld"
+      image: { enabled: true, type: "URL", data: "https://l.top4top.io/p_3934d6xch1.png" }   # type: PATH or URL
     nether:
       enabled: true
-      text: "🔥 Nether"
-      image: { enabled: false, type: "PATH", data: "" }
+      text: "Nether"
+      image: { enabled: true, type: "URL", data: "https://d.top4top.io/p_3934193ao1.png" }
     end:
       enabled: true
-      text: "🌌 The End"
-      image: { enabled: false, type: "PATH", data: "" }
+      text: "The End"
+      image: { enabled: true, type: "URL", data: "https://h.top4top.io/p_3934iaj7j1.png" }
 
 # --- Messages -----------------------------------------------------------------
 # <prefix> is replaced by messages.prefix. Set a message to "" to disable it.
